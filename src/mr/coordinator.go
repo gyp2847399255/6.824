@@ -62,9 +62,9 @@ func (c *Coordinator) timeoutReducerState(index int) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	if c.mapperState[index] != COMPLETED {
+	if c.reducerState[index] != COMPLETED {
 		fmt.Printf("Reset reducer state %d\n", index)
-		c.mapperState[index] = IDLE
+		c.reducerState[index] = IDLE
 	}
 }
 
