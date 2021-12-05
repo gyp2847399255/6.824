@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"sort"
 	"time"
 )
 import "log"
@@ -19,6 +20,12 @@ type KeyValue struct {
 	Value string
 }
 
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 //
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -32,7 +39,7 @@ func ihash(key string) int {
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
+func Worker(mapFunction func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
@@ -48,7 +55,12 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 
 		if alloc.Kind == MAPPER {
+			resultFilePaths := mapper(alloc.InputFilePath, alloc.Index, alloc.ReducerNumber, mapFunction)
+			MapperFinishWork(alloc.Index, resultFilePaths)
+			continue
+		}
 
+		if alloc.Kind == REDUCER {
 		}
 	}
 	// uncomment to send the Example RPC to the coordinator.
@@ -83,7 +95,7 @@ func mapper(inputFilePath string, index int, reduceNumber int,
 
 	for _, pair := range keyValues {
 		hash := ihash(pair.Key)
-		enc := encoders[hash % reduceNumber]
+		enc := encoders[hash%reduceNumber]
 		enc.Encode(&pair)
 	}
 	var output []string
@@ -101,11 +113,80 @@ func mapper(inputFilePath string, index int, reduceNumber int,
 	return output
 }
 
+func reducer(taskIndex int, reduceFunction func(string, []string) string) {
+	reply := CallAskMapResult(taskIndex)
+	var keyValues []KeyValue
+	for _, file := range reply.FilePaths {
+		f, err := os.Open(file)
+		if err != nil {
+			log.Fatalf("can't open mapper result file %s, %s", file, err.Error())
+		}
+		dec := json.NewDecoder(f)
+		for {
+			kv := new(KeyValue)
+			err = dec.Decode(kv)
+			if err != nil {
+				break
+			}
+			keyValues = append(keyValues, *kv)
+		}
+	}
+
+	sort.Sort(ByKey(keyValues))
+	outputFile, err := os.Create(fmt.Sprintf("mr-out-%d", taskIndex))
+	if err != nil {
+		log.Fatalf("create reducer outputFile file failed, %s", err.Error())
+	}
+	defer outputFile.Close()
+
+	for i := 0; i < len(keyValues); {
+		j := i + 1
+		for j < len(keyValues) && keyValues[j].Key == keyValues[i].Key {
+			j++
+		}
+		var values []string
+		for k := i; k < j; k++ {
+			values = append(values, keyValues[k].Value)
+		}
+		output := reduceFunction(keyValues[i].Key, values)
+		fmt.Fprintf(outputFile, "%v %v\n", keyValues[i].Key, output)
+		i = j
+	}
+}
+
 func CallAllocWork() *AllocWorkerReply {
 	args := new(AllocWorkerArgs)
 	reply := new(AllocWorkerReply)
 	call("Coordinator.AllocWork", args, reply)
 	return reply
+}
+
+func CallAskMapResult(reduceIndex int) *AskMapResultReply {
+	args := AskMapResultArgs{
+		ReducerIndex: reduceIndex,
+	}
+	reply := AskMapResultReply{}
+	call("Coordinator.AskMapResult", &args, &reply)
+	return &reply
+}
+
+func MapperFinishWork(index int, resultFilePaths []string) {
+	args := FinishWorkArgs{
+		Kind:            MAPPER,
+		Index:           index,
+		ResultFilePaths: resultFilePaths,
+	}
+	reply := FinishWordReply{}
+	call("Coordinator.FinishWork", &args, &reply)
+}
+
+func ReduceFinishWork(index int) {
+	args := FinishWorkArgs{
+		Kind:  REDUCER,
+		Index: index,
+	}
+	reply := FinishWordReply{}
+	call("Coordinator.FinishWork", &args, &reply)
 }
 
 //

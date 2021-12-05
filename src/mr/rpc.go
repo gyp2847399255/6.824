@@ -42,6 +42,23 @@ type AllocWorkerReply struct {
 	ReducerNumber int
 }
 
+type FinishWorkArgs struct {
+	Kind            WorkerKind
+	Index           int
+	ResultFilePaths []string
+}
+
+type FinishWordReply struct {
+}
+
+type AskMapResultArgs struct {
+	ReducerIndex int
+}
+
+type AskMapResultReply struct {
+	FilePaths []string
+}
+
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
 // Can't use the current directory since
