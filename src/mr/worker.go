@@ -1,7 +1,10 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"os"
 	"time"
 )
 import "log"
@@ -53,8 +56,49 @@ func Worker(mapf func(string, string) []KeyValue,
 
 }
 
-func mapper(inputFilePath string, index int, reduceNumber int) {
+func mapper(inputFilePath string, index int, reduceNumber int,
+	mapFunction func(string, string) []KeyValue) []string {
+	file, err := os.Open(inputFilePath)
+	if err != nil {
+		log.Fatalf("can't open %s\n", inputFilePath)
+	}
+	defer file.Close()
 
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("can't read %s\n", inputFilePath)
+	}
+	keyValues := mapFunction(inputFilePath, string(content))
+
+	var encoders []*json.Encoder
+	var outputFiles []*os.File
+	for i := 0; i < reduceNumber; i++ {
+		temp, err := ioutil.TempFile(".", "mapper-temp-*")
+		if err != nil {
+			log.Fatalf("can't create temp file %s", err.Error())
+		}
+		outputFiles = append(outputFiles, temp)
+		encoders = append(encoders, json.NewEncoder(temp))
+	}
+
+	for _, pair := range keyValues {
+		hash := ihash(pair.Key)
+		enc := encoders[hash % reduceNumber]
+		enc.Encode(&pair)
+	}
+	var output []string
+	for p, f := range outputFiles {
+		name := f.Name()
+		f.Close()
+		outFile := fmt.Sprintf("mr-%d-%d", index, p)
+		err = os.Rename(name, outFile)
+		if err != nil {
+			log.Fatalf("failed to rename %s", name)
+		}
+		output = append(output, outFile)
+	}
+
+	return output
 }
 
 func CallAllocWork() *AllocWorkerReply {
