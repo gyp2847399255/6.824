@@ -22,8 +22,25 @@ type ExampleReply struct {
 	Y int
 }
 
-// Add your RPC definitions here.
+type WorkerKind int
 
+const (
+	MAPPER WorkerKind = iota
+	REDUCER
+	NONE
+	DONE
+)
+
+// Add your RPC definitions here.
+type AllocWorkerArgs struct {
+}
+
+type AllocWorkerReply struct {
+	Kind          WorkerKind
+	Index         int
+	InputFilePath string
+	ReducerNumber int
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
