@@ -40,7 +40,7 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 //
 func Worker(mapFunction func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+	reduceFunction func(string, []string) string) {
 
 	// Your worker implementation here.
 	for {
@@ -61,11 +61,13 @@ func Worker(mapFunction func(string, string) []KeyValue,
 		}
 
 		if alloc.Kind == REDUCER {
+			reducer(alloc.Index, reduceFunction)
+			ReduceFinishWork(alloc.Index)
+			continue
 		}
 	}
 	// uncomment to send the Example RPC to the coordinator.
 	//CallExample()
-
 }
 
 func mapper(inputFilePath string, index int, reduceNumber int,
@@ -176,7 +178,7 @@ func MapperFinishWork(index int, resultFilePaths []string) {
 		Index:           index,
 		ResultFilePaths: resultFilePaths,
 	}
-	reply := FinishWordReply{}
+	reply := FinishWorkReply{}
 	call("Coordinator.FinishWork", &args, &reply)
 }
 
@@ -185,7 +187,7 @@ func ReduceFinishWork(index int) {
 		Kind:  REDUCER,
 		Index: index,
 	}
-	reply := FinishWordReply{}
+	reply := FinishWorkReply{}
 	call("Coordinator.FinishWork", &args, &reply)
 }
 

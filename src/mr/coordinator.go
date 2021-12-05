@@ -109,6 +109,54 @@ func (c *Coordinator) AllocWork(args *AllocWorkerArgs, reply *AllocWorkerReply) 
 	return nil
 }
 
+func (c *Coordinator) FinishWork(args *FinishWorkArgs, reply *FinishWorkReply) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	switch args.Kind {
+	case DONE:
+		return nil
+	case MAPPER:
+		fmt.Printf("finish mapper %d\n", args.Index)
+		c.mapperState[args.Index] = COMPLETED
+		c.mapperResultFiles[args.Index] = args.ResultFilePaths
+		c.remainMapperNumber -= 1
+		if c.remainMapperNumber == 0 {
+			c.mapFinished.Broadcast()
+		}
+		return nil
+	case REDUCER:
+		fmt.Printf("finish reducer %d\n", args.Index)
+		c.reducerState[args.Index] = COMPLETED
+		c.remainReducerNumber -= 1
+		if c.remainReducerNumber == 0 {
+			c.finished = true
+		}
+		return nil
+	}
+	return nil
+}
+
+func (c *Coordinator) AskMapResult(args *AskMapResultArgs, reply *AskMapResultReply) error {
+	fmt.Printf("reducer %d ask map result\n", args.ReducerIndex)
+	c.mutex.Lock()
+	if c.remainMapperNumber != 0 {
+		fmt.Println("wait for mapper finish")
+		c.mapFinished.Wait()
+		fmt.Println("mapper condition released")
+	}
+	c.mutex.Unlock()
+
+	ret := make([]string, len(c.inputFiles))
+	for i, files := range c.mapperResultFiles {
+		ret[i] = files[args.ReducerIndex]
+	}
+
+	reply.FilePaths = ret
+	fmt.Printf("reply for reducer %d\n", args.ReducerIndex)
+	return nil
+}
+
 //
 // start a thread that listens for RPCs from worker.go
 //
@@ -130,11 +178,25 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	ret := false
 
 	// Your code here.
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 
-	return ret
+	for _, state := range c.mapperState {
+		if state != COMPLETED {
+			return false
+		}
+	}
+
+	for _, state := range c.reducerState {
+		if state != COMPLETED {
+			return false
+		}
+	}
+
+	c.finished = true
+	return true
 }
 
 //

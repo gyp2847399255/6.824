@@ -48,7 +48,7 @@ type FinishWorkArgs struct {
 	ResultFilePaths []string
 }
 
-type FinishWordReply struct {
+type FinishWorkReply struct {
 }
 
 type AskMapResultArgs struct {
