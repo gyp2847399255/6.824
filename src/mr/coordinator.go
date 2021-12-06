@@ -30,8 +30,7 @@ type Coordinator struct {
 	remainMapperNumber  int
 	remainReducerNumber int
 
-	mapFinished sync.Cond
-	mutex       sync.Mutex
+	mutex sync.Mutex
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -94,7 +93,7 @@ func (c *Coordinator) AllocWork(args *AllocWorkerArgs, reply *AllocWorkerReply) 
 	if c.remainMapperNumber == 0 {
 		for index, state := range c.reducerState {
 			if state == IDLE {
-				fmt.Printf("alloc reducer")
+				fmt.Printf("alloc reducer\n")
 				reply.Index = index
 				reply.Kind = REDUCER
 				reply.InputFilePath = ""
@@ -121,9 +120,6 @@ func (c *Coordinator) FinishWork(args *FinishWorkArgs, reply *FinishWorkReply) e
 		c.mapperState[args.Index] = COMPLETED
 		c.mapperResultFiles[args.Index] = args.ResultFilePaths
 		c.remainMapperNumber -= 1
-		if c.remainMapperNumber == 0 {
-			c.mapFinished.Broadcast()
-		}
 		return nil
 	case REDUCER:
 		fmt.Printf("finish reducer %d\n", args.Index)
@@ -139,13 +135,6 @@ func (c *Coordinator) FinishWork(args *FinishWorkArgs, reply *FinishWorkReply) e
 
 func (c *Coordinator) AskMapResult(args *AskMapResultArgs, reply *AskMapResultReply) error {
 	fmt.Printf("reducer %d ask map result\n", args.ReducerIndex)
-	c.mutex.Lock()
-	if c.remainMapperNumber != 0 {
-		fmt.Println("wait for mapper finish")
-		c.mapFinished.Wait()
-		fmt.Println("mapper condition released")
-	}
-	c.mutex.Unlock()
 
 	ret := make([]string, len(c.inputFiles))
 	for i, files := range c.mapperResultFiles {
@@ -219,7 +208,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		finished:            false,
 		mutex:               sync.Mutex{},
 	}
-	c.mapFinished = *sync.NewCond(&c.mutex)
 
 	c.server()
 	return &c
