@@ -42,6 +42,7 @@ func ihash(key string) int {
 func Worker(mapFunction func(string, string) []KeyValue,
 	reduceFunction func(string, []string) string) {
 
+	fmt.Println("start worker!")
 	// Your worker implementation here.
 	for {
 		alloc := CallAllocWork()
