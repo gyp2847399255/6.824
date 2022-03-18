@@ -18,14 +18,17 @@ package raft
 //
 
 import (
-//	"bytes"
+	"context"
+	"log"
+	"sort"
+	"time"
+
+	//	"bytes"
 	"sync"
 	"sync/atomic"
 
-//	"6.824/labgob"
 	"6.824/labrpc"
 )
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -48,32 +51,66 @@ type ApplyMsg struct {
 	Snapshot      []byte
 	SnapshotTerm  int
 	SnapshotIndex int
+
+	LeaderValid bool
+	Term        int
 }
+
+type LogEntry struct {
+	Cmd   interface{}
+	Index int
+	Term  int
+}
+
+type RaftRole int
+
+const (
+	FOLLOWER = iota
+	CANDIDATE
+	LEADER
+)
 
 //
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mutex     sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
-
+	role      RaftRole
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	applyCh chan ApplyMsg
 
+	cancelFunc  context.CancelFunc
+	ctx         context.Context
+	electTicker *time.Ticker
+
+	currentTerm int
+	votedFor    *int
+	logs        []LogEntry
+
+	commitIndex      int
+	lastApplied      int
+	shouldCommitChan chan struct{}
+
+	nextIndex  []int
+	matchIndex []int
+	logTrigger []chan int
+
+	snapshot []byte
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
+	return rf.currentTerm, rf.role == LEADER
 }
 
 //
@@ -91,7 +128,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -115,7 +151,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
@@ -136,13 +171,16 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -151,6 +189,36 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term          int
+	Success       bool
+	ConflictTerm  int
+	ConflictIndex int
+}
+
+type InstallSnapShotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Snapshot          []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
 }
 
 //
@@ -158,6 +226,116 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+	if args.Term > rf.currentTerm {
+		DPrintf("REQUEST_VOTE receive higher term %d from peer %d",
+			args.Term, args.CandidateId)
+		rf.updateTerm(args.Term)
+		rf.changeRole(FOLLOWER)
+	}
+	reply.Term = args.Term
+	if rf.votedFor == nil || *rf.votedFor == args.CandidateId {
+		lastLogIndex := rf.lastLogIndex()
+		lastLogTerm := rf.lastLogTerm()
+		if args.LastLogTerm > lastLogTerm ||
+			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
+			reply.VoteGranted = true
+			rf.electTicker.Reset(GenElectTimeout())
+			rf.votedFor = new(int)
+			*rf.votedFor = args.CandidateId
+			rf.persist()
+			DPrintf("REQUEST_VOTE vote for peer %d", args.CandidateId)
+		}
+	} else {
+		reply.VoteGranted = false
+	}
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	rf.electTicker.Reset(GenElectTimeout())
+	if args.Term > rf.currentTerm {
+		DPrintf("AppendEntries receive higher term %d from leader %d", args.Term, args.LeaderId)
+		rf.updateTerm(args.Term)
+		rf.changeRole(FOLLOWER)
+	}
+	reply.Term = rf.currentTerm
+
+	lastIncludedIndex := rf.lastIncludedIndex()
+	lastIncludedTerm := rf.lastIncludedTerm()
+	if args.PrevLogIndex < lastIncludedIndex {
+		startPos := lastIncludedIndex - args.PrevLogIndex
+		if startPos >= len(args.Entries) {
+			args.Entries = []LogEntry{}
+			reply.Success = true
+			return
+		}
+		args.Entries = args.Entries[startPos:]
+		args.PrevLogIndex = lastIncludedIndex
+		args.PrevLogTerm = lastIncludedTerm
+	}
+
+	prevLogPos := rf.findLogPosByIndex(args.PrevLogIndex)
+	if prevLogPos < 0 {
+		reply.ConflictIndex = rf.lastLogIndex() + 1
+		reply.ConflictTerm = -1
+		return
+	}
+	prevLogEntry := &rf.logs[prevLogPos]
+	if prevLogEntry.Term != args.PrevLogTerm {
+		reply.ConflictTerm = prevLogEntry.Term
+		for i := prevLogPos; i >= 0 && rf.logs[i].Term == reply.ConflictTerm; i-- {
+			reply.ConflictIndex = i
+		}
+		return
+	}
+
+	reply.Success = true
+	hasUpdate := false
+	for i, newEntry := range args.Entries {
+		pos := prevLogPos + i + 1
+		if pos >= len(rf.logs) {
+			rf.logs = append(rf.logs, newEntry)
+			hasUpdate = true
+		} else {
+			oldEntry := &rf.logs[pos]
+			if oldEntry.Term != newEntry.Term {
+				rf.logs = rf.logs[:pos]
+				rf.logs = append(rf.logs, args.Entries[i:]...)
+				hasUpdate = true
+				break
+			}
+		}
+	}
+	if hasUpdate {
+		rf.persist()
+	}
+	if args.LeaderCommit > rf.commitIndex {
+		newEntryIndex := args.PrevLogIndex
+		if len(args.Entries) > 0 {
+			newEntryIndex = args.Entries[len(args.Entries)-1].Index
+		}
+		newCommitIndex := minInt(args.LeaderCommit, newEntryIndex)
+		if newCommitIndex > rf.commitIndex {
+			DPrintf("APPEND_ENTRIES update commitIndex %d => %d, with leader commit %d",
+				rf.commitIndex, newCommitIndex, args.LeaderCommit)
+			rf.commitIndex = newCommitIndex
+			rf.tickApplier()
+		}
+	}
 }
 
 //
@@ -194,6 +372,15 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapShotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -216,7 +403,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-
 	return index, term, isLeader
 }
 
@@ -234,6 +420,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.cancelFunc()
 }
 
 func (rf *Raft) killed() bool {
@@ -241,15 +428,387 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) stepCommitIndex() (int, bool) {
+	oldCommitIndex := rf.commitIndex
+	matchIndices := make([]int, rf.peerNumber())
+	copy(matchIndices, rf.matchIndex)
+	sort.Ints(matchIndices)
+	index := matchIndices[rf.majority()-1]
+	if index > oldCommitIndex {
+		logEntry := rf.findLogByIndex(index)
+		if logEntry != nil && logEntry.Term == rf.currentTerm {
+			rf.commitIndex = index
+			return index, true
+		}
+	}
+	return oldCommitIndex, false
+}
+
+func (rf *Raft) replicator(ctx context.Context, target int) {
+	DPrintf("REPLICATED %d start", target)
+	defer DPrintf("REPLICATED %d exit", target)
+	ticker := time.NewTicker(HEARTBEAT_TIMEOUT)
+	var prevChan chan int = nil
+	var fast int32 = 0
+	for !rf.killed() {
+		tick := false
+		if prevChan == nil {
+			DPrintf("REPLICATOR %d select on log and ticker", target)
+			select {
+			case <-ctx.Done():
+				DPrintf("REPLICATOR %d exit by context cancel", target)
+				return
+			case <-rf.logTrigger[target]:
+				DPrintf("REPLICATOR %d tick by log", target)
+			case <-ticker.C:
+				DPrintf("REPLICATOR %d tick by heartbeat 1", target)
+				tick = true
+			}
+		} else {
+			DPrintf("REPLICATOR %d select on prev and ticker", target)
+			select {
+			case <-ctx.Done():
+				DPrintf("REPLICATOR %d exit", target)
+				return
+			case <-ticker.C:
+				DPrintf("REPLICATOR %d tick by heartbeat 2", target)
+				tick = true
+			case n := <-prevChan:
+				DPrintf("REPLICATOR %d prev sync finish: %d", target, n)
+			}
+		}
+		rf.mutex.Lock()
+		if len(rf.logTrigger[target]) > 0 {
+			<-rf.logTrigger[target]
+		}
+		if !(rf.role == LEADER && (tick || (rf.nextIndex[target] <= rf.lastLogIndex()))) {
+			rf.mutex.Unlock()
+			prevChan = nil
+			continue
+		}
+
+		term := rf.currentTerm
+		commitIndex := rf.commitIndex
+
+		if rf.nextIndex[target] > rf.lastIncludedIndex() {
+			prevLogEntry := rf.findLogByIndex(rf.nextIndex[target] - 1)
+			prevLogIndex := prevLogEntry.Index
+			prevLogTerm := prevLogEntry.Term
+			maxLog := 1
+			if f := atomic.LoadInt32(&fast); f > 0 {
+				DPrintf("REPLICATOR %d fast send, max step: %d", target, MAX_SEND_STEP)
+				maxLog = MAX_SEND_STEP
+			}
+			logsToSend := rf.findLogSliceByIndex(rf.nextIndex[target], maxLog)
+			args := new(AppendEntriesArgs)
+			*args = AppendEntriesArgs{
+				Term:         term,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      logsToSend,
+				LeaderCommit: commitIndex,
+			}
+			if len(logsToSend) == 0 {
+				DPrintf("REPLICATOR %d sent heart beat, prevLogIndex %d, "+
+					"prevLogTerm %d, commitIndex %d", target, prevLogIndex, prevLogTerm, commitIndex)
+				prevChan = nil
+			} else {
+				DPrintf("REPLICATOR %d send logs [%d, %d], prevLogIndex %d, prevLogTerm %d, commitIndex %d",
+					target, logsToSend[0].Index, logsToSend[len(logsToSend)-1].Index,
+					prevLogIndex, prevLogTerm, commitIndex)
+				prevChan = make(chan int, 1)
+			}
+			rf.mutex.Unlock()
+			go func(retChan chan int) {
+				reply := &AppendEntriesReply{}
+				ticker.Reset(HEARTBEAT_TIMEOUT)
+				res := rf.sendAppendEntries(target, args, reply)
+				if !res {
+					if retChan != nil {
+						retChan <- 1
+					}
+					return
+				}
+				rf.mutex.Lock()
+				if args.Term != rf.currentTerm {
+					rf.mutex.Unlock()
+					if retChan != nil {
+						retChan <- 2
+					}
+					return
+				}
+
+				if reply.Term > rf.currentTerm {
+					atomic.StoreInt32(&fast, 0)
+					rf.changeRole(FOLLOWER)
+					rf.updateTerm(reply.Term)
+					rf.mutex.Unlock()
+					if retChan != nil {
+						retChan <- 3
+					}
+					return
+				}
+
+				if reply.Success {
+					atomic.StoreInt32(&fast, 1)
+					length := len(args.Entries)
+					oldNextIndex := rf.nextIndex[target]
+					rf.nextIndex[target] = maxInt(rf.nextIndex[target], args.PrevLogIndex+length+1)
+					DPrintf("REPLICATOR %d step nextIndex %d => %d",
+						target, oldNextIndex, rf.nextIndex[target])
+
+					oldMatchIndex := rf.matchIndex[target]
+					rf.matchIndex[target] = maxInt(rf.matchIndex[target], args.PrevLogIndex+length)
+					DPrintf("REPLICATOR %d step matchIndex %d => %d",
+						target, oldMatchIndex, rf.matchIndex[target])
+
+					oldCommitIndex := rf.commitIndex
+					newCommitIndex, ok := rf.stepCommitIndex()
+					if ok {
+						DPrintf("REPLICATOR %d step commitIndex %d => %d",
+							target, oldCommitIndex, newCommitIndex)
+						rf.tickApplier()
+						args = new(AppendEntriesArgs)
+						*args = AppendEntriesArgs{
+							Term:         term,
+							LeaderId:     rf.me,
+							PrevLogIndex: rf.commitIndex,
+							PrevLogTerm:  rf.currentTerm,
+							Entries:      []LogEntry{},
+							LeaderCommit: rf.commitIndex,
+						}
+						rf.broadcastAppendEntries(args)
+						rf.mutex.Unlock()
+						if retChan != nil {
+							retChan <- 0
+						}
+						return
+					}
+					rf.mutex.Unlock()
+					if retChan != nil {
+						retChan <- 0
+					}
+					return
+				}
+				DPrintf("REPLICATOR %d, sync log failed, ConflictIndex %d, ConflictTerm %d",
+					target, reply.ConflictIndex, reply.ConflictTerm)
+				if rf.nextIndex[target] == args.PrevLogIndex+1 {
+					atomic.StoreInt32(&fast, 0)
+					oldNextIndex := rf.nextIndex[target]
+					rf.nextIndex[target] = reply.ConflictIndex
+					if reply.ConflictTerm < 0 {
+						DPrintf("REPLICATOR %d, step down next index %d => %d",
+							target, oldNextIndex, rf.nextIndex[target])
+					} else {
+						for i := len(rf.logs) - 1; i >= 0; i-- {
+							if rf.logs[i].Term == reply.ConflictTerm {
+								rf.nextIndex[target] = rf.logs[i].Index + 1
+								break
+							}
+						}
+						if rf.nextIndex[target] >= oldNextIndex {
+							DPrintf("REPLICATOR %d, panic step next index failed %d => %d",
+								target, oldNextIndex, rf.nextIndex[target])
+							log.Fatalf("step next index failed")
+						}
+						DPrintf("REPLICATOR %d, step down next index %d => %d",
+							target, oldNextIndex, rf.nextIndex[target])
+					}
+				}
+				rf.mutex.Unlock()
+				if retChan != nil {
+					retChan <- 4
+				}
+				return
+			}(prevChan)
+		} else {
+			if rf.snapshot == nil || len(rf.snapshot) == 0 {
+				DPrintf("REPLICATOR %d can't find snapshot to send", target)
+				log.Fatalf("REPLICATOR %d can't find snapshot to send", target)
+			}
+			lastIncludedIndex := rf.lastIncludedIndex()
+			lastIncludedTerm := rf.lastIncludedTerm()
+			args := new(InstallSnapShotArgs)
+			*args = InstallSnapShotArgs{
+				Term:              rf.currentTerm,
+				LeaderId:          rf.me,
+				LastIncludedIndex: lastIncludedIndex,
+				LastIncludedTerm:  lastIncludedTerm,
+				Snapshot:          rf.snapshot,
+			}
+			DPrintf("REPLICATOR %d install snapshot lastIncludedIndex %d, lastIncludedTerm %d",
+				target, lastIncludedIndex, lastIncludedTerm)
+			rf.mutex.Unlock()
+			prevChan = make(chan int, 1)
+			go func(retChan chan int) {
+				reply := new(InstallSnapshotReply)
+				ticker.Reset(HEARTBEAT_TIMEOUT)
+				ok := rf.sendInstallSnapshot(target, args, reply)
+				if !ok {
+					retChan <- 0
+				}
+				rf.mutex.Lock()
+				if args.Term != rf.currentTerm {
+					rf.mutex.Unlock()
+					return
+				}
+				if args.Term > rf.currentTerm {
+					rf.updateTerm(args.Term)
+					rf.changeRole(FOLLOWER)
+					rf.mutex.Unlock()
+					return
+				}
+				atomic.StoreInt32(&fast, 1)
+				oldMatchIndex := rf.matchIndex[target]
+				rf.matchIndex[target] = maxInt(rf.matchIndex[target], args.LastIncludedIndex)
+				DPrintf("REPLICATOR %d install snapshot step matchIndex %d => %d",
+					target, oldMatchIndex, rf.nextIndex[target])
+				oldCommitIndex := rf.commitIndex
+				if newCommitIndex, ok := rf.stepCommitIndex(); ok {
+					DPrintf("REPLICATOR %d install snapshot update commitIndex %d => %d",
+						target, oldCommitIndex, newCommitIndex)
+					rf.tickApplier()
+				}
+				rf.mutex.Unlock()
+				retChan <- 0
+			}(prevChan)
+		}
+	}
+}
+
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
-func (rf *Raft) ticker() {
+func (rf *Raft) ticker(ctx context.Context) {
+	DPrintf("TICKER START")
+	defer DPrintf("TICKER EXIT")
 	for rf.killed() == false {
-
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		select {
+		case <-ctx.Done():
+			DPrintf("TICKER exit by context cancel")
+			return
+		case <-rf.electTicker.C:
+		}
 
+		rf.electTicker.Reset(GenElectTimeout())
+		rf.mutex.Lock()
+		if rf.role == LEADER {
+			rf.mutex.Unlock()
+			continue
+		}
+
+		rf.changeRole(CANDIDATE)
+		rf.updateTerm(rf.currentTerm + 1)
+		DPrintf("TICKER start election, term %d", rf.currentTerm)
+		currentTerm := rf.currentTerm
+		lastLogIndex := rf.lastLogIndex()
+		lastLogTerm := rf.lastLogTerm()
+		getVote := new(int32)
+		if rf.votedFor == nil {
+			*getVote = 1
+			rf.votedFor = new(int)
+			*rf.votedFor = rf.me
+		}
+		rf.mutex.Unlock()
+		rf.electTicker.Reset(GenElectTimeout())
+		args := RequestVoteArgs{
+			Term:         currentTerm,
+			CandidateId:  rf.me,
+			LastLogIndex: lastLogIndex,
+			LastLogTerm:  lastLogTerm,
+		}
+		for i := 0; i < rf.peerNumber(); i++ {
+			if i == rf.me {
+				continue
+			}
+			go func(target int) {
+				reply := new(RequestVoteReply)
+				ok := rf.sendRequestVote(target, &args, reply)
+				if !ok {
+					return
+				}
+				rf.mutex.Lock()
+				defer rf.mutex.Unlock()
+				if currentTerm != rf.currentTerm {
+					return
+				}
+				if reply.Term > currentTerm {
+					rf.changeRole(FOLLOWER)
+					rf.updateTerm(reply.Term)
+					return
+				}
+				if reply.VoteGranted {
+					DPrintf("TICKER receive vote from peer %d for election in term %d",
+						target, currentTerm)
+					out := atomic.AddInt32(getVote, 1)
+					if out == int32(rf.majority()) {
+						rf.changeRole(LEADER)
+						DPrintf("TICKER become leader")
+						/*go func() {
+							rf.applyCh <- ApplyMsg{
+								LeaderValid: true,
+								Term:        currentTerm,
+							}
+						}()*/
+					}
+				}
+			}(i)
+		}
+	}
+}
+
+func (rf *Raft) applier(ctx context.Context) {
+	DPrintf("APPLIER START")
+	defer DPrintf("APPLIER EXIT")
+	rf.mutex.Lock()
+	if rf.snapshot != nil && len(rf.snapshot) > 0 {
+		DPrintf("APPLIER apply init snapshot")
+		snapshot := rf.snapshot
+		lastIncludedIndex := rf.lastIncludedIndex()
+		lastIncludedTerm := rf.lastIncludedTerm()
+		rf.mutex.Unlock()
+		rf.applyCh <- ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      snapshot,
+			SnapshotTerm:  lastIncludedTerm,
+			SnapshotIndex: lastIncludedIndex,
+		}
+	} else {
+		rf.mutex.Unlock()
+	}
+
+	for !rf.killed() {
+		select {
+		case <-ctx.Done():
+			DPrintf("APPLIER exit by context cancel")
+			return
+		case <-rf.shouldCommitChan:
+			DPrintf("APPLIER wake")
+		}
+		rf.mutex.Lock()
+		rf.lastApplied = maxInt(rf.lastApplied, rf.lastIncludedIndex())
+		DPrintf("APPLIER apply to %d, last applied %d", rf.commitIndex, rf.lastApplied)
+		for rf.lastApplied < rf.commitIndex {
+			rf.lastApplied++
+			logEntry := rf.findLogByIndex(rf.lastApplied)
+			if logEntry == nil {
+				DPrintf("can't find logEntry index %d", rf.lastApplied)
+				log.Fatalf("can't find logEntry index %d", rf.lastApplied)
+			}
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      logEntry.Cmd,
+				CommandIndex: logEntry.Index,
+			}
+			rf.mutex.Unlock()
+			DPrintf("APPLIER apply log entry %d, command: %v", applyMsg.CommandIndex, applyMsg.Command)
+			rf.applyCh <- applyMsg
+			rf.mutex.Lock()
+		}
+		rf.mutex.Unlock()
 	}
 }
 
@@ -270,15 +829,37 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.currentTerm = 0
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.ctx, rf.cancelFunc = context.WithCancel(context.Background())
+	rf.votedFor = nil
+	rf.logs = []LogEntry{{Cmd: nil, Term: 0, Index: 0}}
+	rf.electTicker = time.NewTicker(GenElectTimeout())
+	rf.shouldCommitChan = make(chan struct{}, 1)
+
+	rf.logTrigger = make([]chan int, rf.peerNumber())
+	for i := 0; i < rf.peerNumber(); i++ {
+		rf.logTrigger[i] = make(chan int, 1)
+	}
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	/*
+		rf.readPersist(persister.ReadRaftState())
+		rf.lastApplied = 0
+		rf.snapshot = persister.ReadSnapshot()
 
+	*/
 	// start ticker goroutine to start elections
-	go rf.ticker()
+	go rf.ticker(rf.ctx)
+	//go rf.applier(rf.ctx)
+	for target := 0; target < rf.peerNumber(); target++ {
+		if target != rf.me {
+			go rf.replicator(rf.ctx, target)
+		}
+	}
 
-
+	DPrintf("MAKE peer start")
 	return rf
 }
